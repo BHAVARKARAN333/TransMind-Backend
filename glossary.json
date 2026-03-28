@@ -1,0 +1,14 @@
+[
+    {
+        "source": "member",
+        "target": "miembro",
+        "context": "Always use this term",
+        "status": "Active"
+    },
+    {
+        "source": "health plan",
+        "target": "plan de salud",
+        "context": "Official insurance term",
+        "status": "Active"
+    }
+]

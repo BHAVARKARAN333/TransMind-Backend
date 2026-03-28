@@ -1,0 +1,19 @@
+# Node/JS
+node_modules/
+dist/
+build/
+.env*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+venv/
+env/
+.env
+.venv/
+.pytest_cache/
+
+# System
+.DS_Store
+Thumbs.db
