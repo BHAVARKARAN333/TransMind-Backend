@@ -1,43 +1,34 @@
-from sentence_transformers import SentenceTransformer, util
-import torch
-
-try:
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-except Exception as e:
-    print(f"Warning: Could not load sentence-transformer model immediately. Error: {e}")
-    model = None
+"""
+Lightweight Translation Memory using TF-IDF + Cosine Similarity.
+This replaces the heavy sentence-transformers + PyTorch approach
+to stay under Render's 512MB RAM free-tier limit.
+"""
+from difflib import SequenceMatcher
 
 class VectorStoreMemory:
     def __init__(self):
-        self.stored_pairs = [] # list of dicts: {"source": str, "translation": str, "target_lang": str}
-        self.stored_embeddings = None
+        self.stored_pairs = []  # list of dicts: {"source": str, "translation": str, "target_lang": str}
 
-    def add_pairs(self, pairs: list[dict]) -> int:
+    def _similarity(self, a: str, b: str) -> float:
+        """Compute similarity ratio between two strings using SequenceMatcher (0.0 to 1.0)."""
+        return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
+
+    def add_pairs(self, pairs: list) -> int:
         """
-        Embeds and stores a list of source-translation pairs in memory.
+        Stores a list of source-translation pairs in memory.
         Each pair should have: {"source": str, "translation": str, "target_lang": str}
         """
-        if not pairs or model is None:
+        if not pairs:
             return 0
-            
-        sources = [p["source"] for p in pairs]
-        new_embeddings = model.encode(sources, convert_to_tensor=True)
-        
-        if self.stored_embeddings is None:
-            self.stored_embeddings = new_embeddings
-            self.stored_pairs.extend(pairs)
-        else:
-            self.stored_embeddings = torch.cat((self.stored_embeddings, new_embeddings), 0)
-            self.stored_pairs.extend(pairs)
-            
+        self.stored_pairs.extend(pairs)
         return len(pairs)
 
     def find_best_match(self, input_sentence: str, target_lang: str = "") -> dict:
         """
-        Computes cosine similarity and builds the AI decision.
+        Finds the best matching source sentence using sequence-based similarity.
         If target_lang is provided, only matches against pairs with the same target_lang.
         """
-        if self.stored_embeddings is None or len(self.stored_pairs) == 0 or model is None:
+        if not self.stored_pairs:
             return {
                 "input_sentence": input_sentence,
                 "best_match_source": None,
@@ -47,15 +38,15 @@ class VectorStoreMemory:
                 "action": "Send to AI translation",
                 "confidence": "Low"
             }
-        
-        # Filter indices by target_lang if specified
+
+        # Filter by target_lang if specified
         if target_lang:
-            valid_indices = [i for i, p in enumerate(self.stored_pairs) 
+            candidates = [p for p in self.stored_pairs
                           if p.get("target_lang", "").lower() == target_lang.lower()]
         else:
-            valid_indices = list(range(len(self.stored_pairs)))
-        
-        if not valid_indices:
+            candidates = self.stored_pairs
+
+        if not candidates:
             return {
                 "input_sentence": input_sentence,
                 "best_match_source": None,
@@ -65,20 +56,16 @@ class VectorStoreMemory:
                 "action": "Send to AI translation",
                 "confidence": "Low"
             }
-            
-        input_emb = model.encode(input_sentence, convert_to_tensor=True)
-        cosine_scores = util.cos_sim(input_emb, self.stored_embeddings)[0]
-        
-        # Only consider valid indices (matching language pair)
-        filtered_scores = [(idx, cosine_scores[idx].item()) for idx in valid_indices]
-        best_idx, best_score = max(filtered_scores, key=lambda x: x[1])
-        best_pair = self.stored_pairs[best_idx]
-        
-        if best_score >= 0.98:
+
+        # Compute similarity for each candidate
+        scored = [(p, self._similarity(input_sentence, p["source"])) for p in candidates]
+        best_pair, best_score = max(scored, key=lambda x: x[1])
+
+        if best_score >= 0.95:
             match_type = "Exact Match"
             action = "Reuse previous translation"
             confidence = "High"
-        elif best_score >= 0.85:
+        elif best_score >= 0.75:
             match_type = "Fuzzy Match"
             action = "Suggest with review"
             confidence = "Medium"
@@ -86,7 +73,7 @@ class VectorStoreMemory:
             match_type = "New Translation Required"
             action = "Send to AI translation"
             confidence = "Low"
-            
+
         return {
             "input_sentence": input_sentence,
             "best_match_source": best_pair["source"] if match_type != "New Translation Required" else None,
@@ -99,6 +86,5 @@ class VectorStoreMemory:
 
     def clear_memory(self):
         self.stored_pairs = []
-        self.stored_embeddings = None
 
 memory_bank = VectorStoreMemory()

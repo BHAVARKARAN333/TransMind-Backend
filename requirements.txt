@@ -7,6 +7,5 @@ docx2pdf
 google-generativeai
 pydantic
 python-dotenv
-sentence-transformers
 langdetect
 PyMuPDF
