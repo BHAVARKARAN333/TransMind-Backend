@@ -42,6 +42,10 @@ def convert_to_pdf_safe(docx_path, pdf_path):
 
 app = FastAPI(title="TransMind AI - Backend API")
 
+@app.get("/")
+def read_root():
+    return {"status": "ok", "message": "TransMind Backend is running"}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173"],
