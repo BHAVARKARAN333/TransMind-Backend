@@ -1,18 +1,20 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from auth_middleware import verify_token
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
-import base64, io, os, sys, subprocess, shutil, tempfile
+import asyncio, base64, io, os, sys, subprocess, shutil, tempfile
 from text_processor import process_text
 from similarity_module import memory_bank
 from docx_extractor import extract_docx
-from llm_translator import translate_batch, detect_language, memory_store as llm_memory_store
+from llm_translator import translate_batch, detect_language
 from docx_exporter import export_docx
 from ai_validator import validate_with_ai
 from glossary_manager import glossary_db
+from history_module import history_db
 
 def convert_to_pdf_safe(docx_path, pdf_path):
     if sys.platform == "win32":
@@ -42,31 +44,17 @@ app = FastAPI(title="TransMind AI - Backend API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Seed vector store from persistent memory.json on startup
+# Seed vector store on startup from previously cached items? 
+# Skipping global seed since memory is now per-user via Firebase Firestore.
 @app.on_event("startup")
 async def seed_vector_store():
-    """Load translations from memory.json into the RAG vector store so matches work after restart."""
-    if not llm_memory_store:
-        return
-    pairs_by_lang = {}
-    for key, translated in llm_memory_store.items():
-        parts = key.split("::", 2)
-        if len(parts) == 3:
-            source_lang, target_lang, source_text = parts
-            pair = {"source": source_text, "translation": translated, "target_lang": target_lang}
-            pairs_by_lang.setdefault(target_lang, []).append(pair)
-    total = 0
-    for lang, pairs in pairs_by_lang.items():
-        added = memory_bank.add_pairs(pairs)
-        total += added
-    if total > 0:
-        print(f"[STARTUP] Seeded {total} translation pairs into RAG vector store from memory.json")
+    print("[STARTUP] Server running with per-user Firebase state.")
 
 # ─── MODELS ───────────────────────────────────────────────
 
@@ -115,6 +103,10 @@ class ExportRequest(BaseModel):
     original_file_base64: str
     original_format: str = "docx"
     target_format: str = "docx"
+    # Added for history persistence
+    filename: str = "Unknown"
+    source_lang: str = "en"
+    target_lang: str = "en"
 
 # ─── TEXT PROCESSING ──────────────────────────────────────
 
@@ -131,61 +123,52 @@ async def api_process_text(req: TextRequest):
 # ─── SIMILARITY / MEMORY ──────────────────────────────────
 
 @app.post("/api/similarity/add")
-async def api_add_sentences(req: AddSentenceRequest):
+async def api_add_sentences(req: AddSentenceRequest, user_id: str = Depends(verify_token)):
     try:
         dict_pairs = [{"source": p.source, "translation": p.translation, "target_lang": p.target_lang} for p in req.pairs]
-        added = memory_bank.add_pairs(dict_pairs)
+        added = memory_bank.add_pairs(user_id, dict_pairs)
         return {"message": f"Successfully added {added} pairs to memory."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/similarity/match")
-async def api_match_sentence(req: MatchRequest):
+async def api_match_sentence(req: MatchRequest, user_id: str = Depends(verify_token)):
     try:
-        result = memory_bank.find_best_match(req.sentence)
+        result = memory_bank.find_best_match(user_id, req.sentence)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/similarity/memory")
-async def api_get_memory():
-    return {"count": len(memory_bank.stored_pairs), "pairs": memory_bank.stored_pairs}
+async def api_get_memory(user_id: str = Depends(verify_token)):
+    pairs = memory_bank.get_memory(user_id)
+    return {"count": len(pairs), "pairs": pairs}
 
 @app.delete("/api/similarity/clear")
-async def api_clear_memory():
-    memory_bank.clear_memory()
+async def api_clear_memory(user_id: str = Depends(verify_token)):
+    memory_bank.clear_memory(user_id)
     return {"message": "Memory cleared."}
 
 @app.get("/api/translation-memory")
-async def api_get_translation_memory():
+async def api_get_translation_memory(user_id: str = Depends(verify_token)):
     """Returns the persistent LLM translation memory as a readable list."""
-    items = []
-    for key, translated in llm_memory_store.items():
-        parts = key.split("::", 2)
-        if len(parts) == 3:
-            source_lang, target_lang, source_text = parts
-            items.append({
-                "source": source_text,
-                "translated": translated,
-                "source_lang": source_lang,
-                "target_lang": target_lang,
-            })
-    return {"count": len(items), "items": items}
+    pairs = memory_bank.get_memory(user_id)
+    return {"count": len(pairs), "items": pairs}
 
 # ─── GLOSSARY MANAGER ─────────────────────────────────────
 
 @app.get("/api/glossary/get")
-async def api_get_glossary():
-    return {"terms": glossary_db.get_terms()}
+async def api_get_glossary(user_id: str = Depends(verify_token)):
+    return {"terms": glossary_db.get_terms(user_id)}
 
 @app.post("/api/glossary/add")
-async def api_add_glossary(term: GlossaryTerm):
-    updated = glossary_db.add_term(term.source, term.target, term.context)
+async def api_add_glossary(term: GlossaryTerm, user_id: str = Depends(verify_token)):
+    updated = glossary_db.add_term(user_id, term.source, term.target, term.context)
     return {"success": True, "updated": updated, "message": "Term saved."}
 
 @app.delete("/api/glossary/delete/{source}")
-async def api_delete_glossary(source: str):
-    deleted = glossary_db.delete_term(source)
+async def api_delete_glossary(source: str, user_id: str = Depends(verify_token)):
+    deleted = glossary_db.delete_term(user_id, source)
     if not deleted:
         raise HTTPException(status_code=404, detail="Term not found")
     return {"success": True, "message": "Term deleted."}
@@ -296,12 +279,16 @@ async def api_detect_language(req: LanguageRequest):
 
 # Phase 4+5: RAG Similarity + Decision Engine for all segments
 @app.post("/api/pipeline/run-rag")
-async def api_run_rag(req: SegmentRequest):
+async def api_run_rag(req: SegmentRequest, user_id: str = Depends(verify_token)):
     try:
         results = []
+        
+        # PRE-FETCH OP: Load memory once so we don't spam 50+ network calls per document!
+        preloaded = memory_bank.get_memory(user_id)
+        
         for seg in req.blocks:  # blocks are segments here
             sentence = seg.get("sentence", seg.get("text", ""))
-            match = memory_bank.find_best_match(sentence, target_lang=req.target_language)
+            match = memory_bank.find_best_match(user_id, sentence, target_lang=req.target_language, preloaded_memory=preloaded)
             results.append({
                 **seg,
                 "similarity_score": match["similarity_score"],
@@ -317,9 +304,12 @@ async def api_run_rag(req: SegmentRequest):
 
 # Phase 6: LLM Translation for "new" sentences
 @app.post("/api/pipeline/translate")
-async def api_translate(req: TranslateRequest):
+async def api_translate(req: TranslateRequest, user_id: str = Depends(verify_token)):
     try:
-        results = translate_batch(
+        # Run in separate thread so parallel requests don't block each other!
+        results = await asyncio.to_thread(
+            translate_batch,
+            user_id,
             req.sentences,
             req.source_language,
             req.target_language,
@@ -330,9 +320,9 @@ async def api_translate(req: TranslateRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Phase 9+10: Export Document (DOCX or PDF)
+# Phase 9+10: Export Document (DOCX or PDF) & Save History
 @app.post("/api/pipeline/export")
-async def api_export(req: ExportRequest):
+async def api_export(req: ExportRequest, user_id: str = Depends(verify_token)):
     try:
         # 1. We always reconstruct a DOCX first
         docx_bytes = export_docx(req.blocks, req.original_file_base64)
@@ -352,21 +342,44 @@ async def api_export(req: ExportRequest):
                 
                 with open(trans_pdf_path, "rb") as f:
                     pdf_bytes = f.read()
+                
+        # 3. Save History to Firestore 
+        import math
+        word_count = sum(len(b.get("translated_text", "").split()) for b in req.blocks if "translated_text" in b)
+        history_db.add_record(
+            user_id=user_id,
+            filename=req.filename,
+            source_lang=req.source_lang,
+            target_lang=req.target_lang,
+            original_format=req.original_format,
+            target_format=req.target_format,
+            status="Completed",
+            word_count=word_count,
+            file_size="Auto"
+        )
 
-            return Response(
-                content=pdf_bytes,
-                media_type="application/pdf",
-                headers={"Content-Disposition": "attachment; filename=translated_document.pdf"}
-            )
-        else:
-            # Return DOCX
-            return Response(
-                content=docx_bytes,
-                media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                headers={"Content-Disposition": "attachment; filename=translated_document.docx"}
-            )
+        return Response(
+            content=pdf_bytes if req.target_format.lower() == "pdf" else docx_bytes,
+            media_type="application/pdf" if req.target_format.lower() == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename=translated_document.{req.target_format.lower()}"}
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ─── HISTORY DASHBOARD ─────────────────────────────────────
+
+@app.get("/api/history")
+async def api_get_history(user_id: str = Depends(verify_token)):
+    records = history_db.get_history(user_id)
+    return {"status": "success", "count": len(records), "data": records}
+
+@app.delete("/api/history/delete/{record_id}")
+async def api_delete_history(record_id: str, user_id: str = Depends(verify_token)):
+    success = history_db.delete_record(user_id, record_id)
+    if not success:
+        raise HTTPException(status_code=500, detail="Failed to delete history record")
+    return {"status": "success", "message": "Record deleted"}
+
 
 # Preview: convert original + translated DOCX to PDF for pixel-perfect document view
 @app.post("/api/pipeline/preview")
@@ -376,6 +389,10 @@ async def api_preview(req: ExportRequest):
     try:
         # Create temp directory for conversion
         with tempfile.TemporaryDirectory() as tmpdir:
+            import json
+            with open("debug_preview.json", "w", encoding="utf-8") as dump_f:
+                json.dump([b.dict() for b in req.blocks] if hasattr(req.blocks[0], 'dict') else req.blocks, dump_f, default=str, indent=2)
+
             # === Original Document ===
             original_bytes = base64.b64decode(req.original_file_base64)
             orig_docx_path = os.path.join(tmpdir, "original.docx")

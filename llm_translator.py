@@ -2,7 +2,9 @@ import os
 import time
 import json
 import logging
+import threading
 from dotenv import load_dotenv
+from similarity_module import memory_bank
 
 load_dotenv()
 
@@ -16,79 +18,58 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─── Constants ───
-MAX_API_CALLS_PER_SESSION = 50
+MAX_API_CALLS_PER_SESSION = 500
 api_calls_made = 0
 
-# ─── API Key Pool Management ───
+# ─── Thread-Safe API Key Pool Management ───
 API_KEYS = []
-CURRENT_KEY_IDX = 0
+_key_lock = threading.Lock()
+_key_counter = 0
 
 def init_keys():
-    global API_KEYS, CURRENT_KEY_IDX
+    global API_KEYS, _key_counter
     raw_keys = os.environ.get("GEMINI_API_KEYS", "")
     if raw_keys:
         API_KEYS = [k.strip() for k in raw_keys.split(",") if k.strip()]
     else:
-        # Fallback to single key if needed
         single = os.environ.get("GEMINI_API_KEY", "")
         if single:
             API_KEYS = [single.strip()]
-    CURRENT_KEY_IDX = 0
+    _key_counter = 0
+    logger.info(f"🔑 Loaded {len(API_KEYS)} API keys for parallel processing")
 
 init_keys()
 
-def _get_active_model():
-    global CURRENT_KEY_IDX
+def _get_next_key_index():
+    """Thread-safe: returns a unique key index for each concurrent request."""
+    global _key_counter
+    with _key_lock:
+        idx = _key_counter % len(API_KEYS)
+        _key_counter += 1
+    return idx
+
+def _get_model_for_key(key_index: int):
+    """Creates a Gemini model instance configured with a specific API key."""
     if not API_KEYS or not GENAI_AVAILABLE:
         return None
-    key = API_KEYS[CURRENT_KEY_IDX]
+    key = API_KEYS[key_index % len(API_KEYS)]
     genai.configure(api_key=key)
     return genai.GenerativeModel('gemini-2.5-flash')
 
+# Keep legacy functions for backward compatibility
+def _get_active_model():
+    idx = _get_next_key_index()
+    return _get_model_for_key(idx)
+
 def _rotate_key():
-    global CURRENT_KEY_IDX
-    if len(API_KEYS) > 1:
-        old_idx = CURRENT_KEY_IDX
-        CURRENT_KEY_IDX = (CURRENT_KEY_IDX + 1) % len(API_KEYS)
-        logger.info(f"🔄 API Key Rotated: Key #{old_idx + 1} ❌ -> Key #{CURRENT_KEY_IDX + 1} ✅")
+    pass  # No longer needed — key rotation is automatic via atomic counter
 
-
-# ─── Persistent Translation Memory ───
-MEMORY_FILE = os.path.join(os.path.dirname(__file__), "memory.json")
-memory_store: dict[str, str] = {}
-# Structure: { "lang_pair::normalized_text": "translated_text" }
 
 def _normalize(text: str) -> str:
     return text.strip().lower()
 
-def _memory_key(source_text: str, source_lang: str, target_lang: str) -> str:
-    return f"{source_lang}::{target_lang}::{_normalize(source_text)}"
-
-def _load_memory():
-    global memory_store
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                memory_store = json.load(f)
-            logger.info(f"[MEMORY] Loaded {len(memory_store)} entries from memory.json")
-        except Exception as e:
-            logger.error(f"[MEMORY] Failed to load memory.json: {e}")
-            memory_store = {}
-    else:
-        logger.info("[MEMORY] No memory.json found. Starting fresh.")
-
-def _save_memory():
-    try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(memory_store, f, ensure_ascii=False, indent=2)
-        logger.info(f"[MEMORY] Saved {len(memory_store)} entries to memory.json")
-    except Exception as e:
-        logger.error(f"[MEMORY] Failed to save memory.json: {e}")
-
-_load_memory()
-
-
 def translate_batch(
+    user_id: str,
     sentences: list[str],
     source_language: str,
     target_language: str,
@@ -96,29 +77,12 @@ def translate_batch(
     glossary: dict | None = None
 ) -> list[dict]:
     """
-    Translates a list of sentences using RAG-first memory, then Gemini API with rotating keys.
+    Translates a list of sentences using Gemini API with rotating keys, and saves to Firestore via user_id.
     """
     global api_calls_made
 
     results_map: dict[int, dict] = {}
-    new_sentences: list[tuple[int, str]] = []  # (original_index, text)
-
-    for idx, sentence in enumerate(sentences):
-        key = _memory_key(sentence, source_language, target_language)
-        if key in memory_store:
-            logger.info(f"[MEMORY] ✅ Reused from memory: '{sentence[:50]}...'")
-            results_map[idx] = {
-                "source": sentence,
-                "translated": memory_store[key],
-                "mode": "memory"
-            }
-        else:
-            logger.info(f"[MEMORY] ❌ Not found, will call API: '{sentence[:50]}...'")
-            new_sentences.append((idx, sentence))
-
-    if not new_sentences:
-        logger.info(f"[MEMORY] All {len(sentences)} sentences served from memory. ZERO API calls!")
-        return [results_map[i] for i in range(len(sentences))]
+    new_sentences: list[tuple[int, str]] = [(idx, s) for idx, s in enumerate(sentences)]
 
     if not API_KEYS or not GENAI_AVAILABLE:
         logger.warning("Gemini API keys missing or SDK not installed. Falling back to MOCK mode.")
@@ -130,9 +94,10 @@ def translate_batch(
             }
         return [results_map[i] for i in range(len(sentences))]
 
-
     only_texts = [s for _, s in new_sentences]
     batch_size = max(len(only_texts), 1)
+    
+    pairs_to_save = []
 
     for i in range(0, len(only_texts), batch_size):
         if api_calls_made >= MAX_API_CALLS_PER_SESSION:
@@ -178,8 +143,11 @@ def translate_batch(
                 mode = "gemini"
 
                 if _normalize(translated) != _normalize(batch_text):
-                    key = _memory_key(batch_text, source_language, target_language)
-                    memory_store[key] = translated
+                    pairs_to_save.append({
+                        "source": batch_text,
+                        "translation": translated,
+                        "target_lang": target_language
+                    })
                 else:
                     logger.warning(f"[MEMORY] ⚠️ Translation == input, NOT saving: '{batch_text[:40]}'")
             else:
@@ -198,19 +166,22 @@ def translate_batch(
         if i + batch_size < len(only_texts):
             time.sleep(1)
 
-    _save_memory()
+    if pairs_to_save:
+        memory_bank.add_pairs(user_id, pairs_to_save)
+        logger.info(f"[MEMORY] Saved {len(pairs_to_save)} new translations to Firestore for user {user_id}")
+
     return [results_map[i] for i in range(len(sentences))]
 
 
 def _call_gemini_with_retry(prompt, original_batch):
-    """Handles API call with key rotation and retry logic."""
+    """Handles API call with automatic key rotation and retry logic."""
     expected_len = len(original_batch)
     
-    # Allow attempts equal to at least looping through all keys 3 times
     total_retries = max(len(API_KEYS) * 3, 15)
     
     for attempt in range(total_retries):
-        model = _get_active_model()
+        key_idx = _get_next_key_index()
+        model = _get_model_for_key(key_idx)
         if not model:
             return []
             
@@ -222,7 +193,7 @@ def _call_gemini_with_retry(prompt, original_batch):
                 raise ValueError(f"Empty or blocked response from Gemini: {feedback}")
                 
             raw_text = response.candidates[0].content.parts[0].text
-            logger.info(f"--- [DEBUG] Raw API Response (Key #{CURRENT_KEY_IDX + 1}, Attempt {attempt+1}) ---\n{raw_text}")
+            logger.info(f"--- [DEBUG] API Response (Key #{key_idx + 1}, Attempt {attempt+1}) ---")
 
             text = raw_text.replace("```json", "").replace("```", "").strip()
             
@@ -251,18 +222,13 @@ def _call_gemini_with_retry(prompt, original_batch):
         except Exception as e:
             error_str = str(e).lower()
             if "429" in error_str or "quota" in error_str or "too many requests" in error_str or "exhausted" in error_str:
-                logger.warning(f"Quota Hit (429) on Key #{CURRENT_KEY_IDX + 1}.")
-                # Only wait if we've cycled through all keys
+                logger.warning(f"Quota Hit (429) on Key #{key_idx + 1}. Auto-switching...")
                 if (attempt + 1) % len(API_KEYS) == 0:
-                    wait_time = 10
-                    logger.warning(f"All {len(API_KEYS)} keys exhausted. Pausing for {wait_time}s to cool down...")
-                    time.sleep(wait_time)
-                else:
-                    logger.warning("Instantly switching to next API key...")
-                _rotate_key()
+                    logger.warning(f"All {len(API_KEYS)} keys exhausted. Cooling down 10s...")
+                    time.sleep(10)
             else:
-                logger.error(f"Gemini API Error (Key #{CURRENT_KEY_IDX + 1}): {e}")
-                time.sleep(2)  # Short sleep for non-rate-limit network errors
+                logger.error(f"Gemini API Error (Key #{key_idx + 1}): {e}")
+                time.sleep(1)
 
     return []
 

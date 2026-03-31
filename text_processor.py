@@ -26,24 +26,22 @@ def split_sentences(text: str) -> list[str]:
     
     protected_text = text
     for abbr in abbreviations:
-        # Replace the literal period in the abbreviation with a special placeholder token
-        protected_abbr = abbr.replace(".", "<PRD>")
-        # Replace exact case
-        protected_text = protected_text.replace(abbr, protected_abbr)
-        # Handle lowercase variants like p.m., a.m., dr.
-        protected_text = protected_text.replace(abbr.lower(), protected_abbr.lower())
+        # Use regex with word boundary to avoid matching "ms." inside "systems."
+        # (?i) makes it case-insensitive
+        pattern = r'(?i)\b' + re.escape(abbr)
+        
+        # We replace the literal period with a unique placeholder
+        # so sentence splitter ignores it.
+        protected_text = re.sub(pattern, lambda m: m.group(0).replace('.', '<PRD>'), protected_text)
 
     # 2. Split the text using standard sentence-ending punctuation (. ? !) OR literal newlines.
-    # We use a regex that splits if:
-    # (a) Punctuation is followed by whitespace and an uppercase letter, number, or bullet, OR
-    # (b) There are one or more newlines (\\n) in the text.
     sentences_raw = re.split(r'(?<=[.?!])\s+(?=[A-Z0-9\u2022\u2023\u25aa\u2713\u2714\u2605•\-\*\"\'\(\u0900-\u097F\u00C0-\u024F])|\n+', protected_text)
     
     # 3. Restore the protected periods and clean up each sentence
     valid_sentences = []
     for sentence in sentences_raw:
-        # Restore the protected period token back to actual periods
-        restored_sentence = sentence.replace("<PRD>", ".")
+        # Restore the protected period token back to actual periods (handle both cases just in case)
+        restored_sentence = sentence.replace("<PRD>", ".").replace("<prd>", ".")
         
         # Trim each sentence
         clean_sent = restored_sentence.strip()

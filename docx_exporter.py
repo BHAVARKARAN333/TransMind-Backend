@@ -59,15 +59,28 @@ def export_docx(blocks: list[dict], original_file_base64: str) -> bytes:
             if not orig or not trans or orig == trans:
                 continue
                 
-            # Create a regex to match the original segment flexibly,
-            # ignoring any spaces/newlines that might have been normalized during preprocessing
-            escaped_orig = re.escape(orig)
-            pattern = escaped_orig.replace(r'\ ', r'\s+')
+            # Create a flexible regex that matches the sequence of words,
+            # ignoring all whitespace, newlines, and ZERO WIDTH spaces.
+            words = orig.split()
+            if not words:
+                continue
+                
+            # Connect escaped words with a permissive whitespace matcher
+            # \s+ covers space, tab, newline. We add \u200b for zero-width spaces etc.
+            pattern = r'[\s\u200b\u00A0]*'.join(re.escape(w) for w in words)
             
-            try:
-                final_text = re.sub(pattern, lambda m: trans, final_text, count=1)
-            except Exception as e:
-                # If regex fails for some weird character combination, fallback to normal replace
+            # Perform substitution and check if it actually replaced anything
+            new_text, count = re.subn(pattern, lambda m: trans, final_text, count=1)
+            
+            print(f"[DEBUG EXPORT] Attempting replace. Words Count: {len(words)}")
+            print(f"[DEBUG EXPORT] Trans string: {trans}")
+            
+            if count > 0:
+                print(f"[DEBUG EXPORT] SUCCESS regex match. Orig: {orig[:30]}...")
+                final_text = new_text
+            else:
+                print(f"[DEBUG EXPORT] FAILED regex match. Trying exact replace. Orig: {orig[:30]}...")
+                # If regex fails to find it (e.g. extreme formatting weirdness), fallback
                 final_text = final_text.replace(orig, trans, 1)
                 
         return final_text
@@ -170,7 +183,7 @@ def _set_wt_text_with_newlines(wt, text: str):
         wt.text = ""
         return
         
-    parts = text.split('\n')
+    parts = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
     wt.text = parts[0]
     
     parent = wt.getparent()
