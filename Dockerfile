@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer \
     default-jre \
     fonts-liberation \
+    fonts-indic \
+    fonts-noto \
+    fonts-noto-cjk \
     fontconfig \
     && rm -rf /var/lib/apt/lists/*
 
