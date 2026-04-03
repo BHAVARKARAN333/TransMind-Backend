@@ -18,7 +18,5 @@ env/
 .DS_Store
 Thumbs.db
 
-# Secrets - NEVER COMMIT
+# Secrets (DO NOT COMMIT)
 firebase-service-account.json
-*.pem
-*.key

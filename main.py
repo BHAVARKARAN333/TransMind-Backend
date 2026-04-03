@@ -425,6 +425,4 @@ async def api_preview(req: ExportRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/")
-def read_root():
-    return {"message": "TransMind AI Backend is running."}
+

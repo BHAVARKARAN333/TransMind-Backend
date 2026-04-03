@@ -1,6 +1,6 @@
 import os, logging
 logging.basicConfig(level=logging.INFO)
-os.environ.setdefault("GEMINI_API_KEY", "AIzaSyAjp4F10ku3g2dcUzr09YL56dTClxwQSvc")
+os.environ.setdefault("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
 
 from llm_translator import translate_batch
 
